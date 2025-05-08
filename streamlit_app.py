@@ -11,6 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 import time
+from dotenv import load_dotenv
 
 # Import functions from the vulnerability scanner module
 from vulnerability_scanner import (
@@ -35,12 +36,17 @@ from gemini_integration import (
 )
 
 # Email configuration
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Email configuration from environment variables with fallbacks
 EMAIL_CONFIG = {
-    "sender_email": "entertain573@gmail.com",
-    "smtp_server": "smtp.gmail.com",
-    "smtp_port": 587,
-    "username": "entertain573@gmail.com",
-    "password": "pfvjpwhzvkpvteyv"
+    "sender_email": os.getenv("EMAIL_SENDER"),
+    "smtp_server": os.getenv("SMTP_SERVER"),
+    "smtp_port": int(os.getenv("SMTP_PORT", "587")),
+    "username": os.getenv("EMAIL_USERNAME"),
+    "password": os.getenv("EMAIL_PASSWORD")
 }
 
 # Define sources with their configurations
@@ -1308,4 +1314,4 @@ def render_ai_analysis_page():
                             st.markdown(content)
 
 if __name__ == "__main__":
-    main() 
+    main()

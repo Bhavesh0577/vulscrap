@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # Initialize Gemini with the API key
-API_KEY = "AIzaSyArOM2WQo89AfBjawULy96GaUjUyaw31vI"  # This should be stored securely in production
+API_KEY = os.environ.get("GEMINI_API")  # This should be stored securely in production
 genai.configure(api_key=API_KEY)
 
 # Use Gemini 2.0 Flash model
