@@ -71,6 +71,11 @@ SOURCES = {
         "type": "web",
         "description": "Cisco Security Advisories"
     },
+     "IBM": {
+        "url": "https://tools.cisco.com/security/center/publicationListing.x",
+        "type": "web",
+        "description": "IBM Security Advisories"
+    },
     "Google": {
         "url": "https://cloud.google.com/support/bulletins",
         "type": "web",
