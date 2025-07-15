@@ -294,9 +294,6 @@ AI prompts can be customized in the `gemini_integration.py` file for different a
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 👥 Author
 
@@ -306,30 +303,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 For support, please open an issue on GitHub or contact the development team.
 
-## 🔄 Version History
-
-- **v1.0.0**: Initial release with basic scanning capabilities
-- **v1.1.0**: Added AI integration with Google Gemini
-- **v1.2.0**: Enhanced email notifications and dashboard
-- **v1.3.0**: Added advanced AI features and threat intelligence
-
-## 📚 Documentation
-
-For detailed documentation on specific features:
-
-- [AI Integration Guide](docs/ai-integration.md)
-- [Configuration Reference](docs/configuration.md)
-- [API Documentation](docs/api.md)
-
-## 🎯 Roadmap
-
-- [ ] Integration with more vulnerability sources
-- [ ] Advanced machine learning models for prediction
-- [ ] REST API for external integrations
-- [ ] Docker containerization
-- [ ] Advanced reporting and analytics
-- [ ] Mobile-responsive improvements
-
----
 
 **⚠️ Disclaimer**: This tool is for educational and security research purposes. Always follow responsible disclosure practices and comply with applicable laws and regulations when using this software.
