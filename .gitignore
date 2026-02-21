@@ -22,3 +22,8 @@ build/
 .vscode/
 *.swp
 .DS_Store
+
+# App artifacts
+*.db
+*.log
+new_vulnerabilities.csv

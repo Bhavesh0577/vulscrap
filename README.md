@@ -17,6 +17,7 @@ A comprehensive, AI-powered vulnerability scanner that monitors multiple OEM sou
   - IBM Security Bulletins
   - Adobe Security Bulletins
   - HPE Security Bulletins
+- **OpenVAS / GVM Active Scanning (Beta)**: Launch authenticated network scans and ingest the results directly into the dashboard
 
 ### AI-Powered Analysis
 
@@ -57,6 +58,7 @@ A comprehensive, AI-powered vulnerability scanner that monitors multiple OEM sou
 - Google Gemini API key
 - Email server credentials (for notifications)
 - Internet connection for vulnerability source monitoring
+- Optional: Access to a running OpenVAS / Greenbone Vulnerability Management server (with GMP access) for active network scanning
 
 ## 🔧 Installation
 
@@ -92,6 +94,23 @@ A comprehensive, AI-powered vulnerability scanner that monitors multiple OEM sou
    EMAIL_PASSWORD=your_app_password
    SMTP_SERVER=smtp.gmail.com
    SMTP_PORT=587
+
+    # OpenVAS / GVM (optional)
+        # Backend selection:
+        # - python-gvm: connect to GMP over TCP/TLS (default)
+        # - docker: run gvm-cli inside the docker compose gvm-tools container (recommended on Windows)
+        OPENVAS_BACKEND=docker
+    OPENVAS_HOST=127.0.0.1
+    OPENVAS_PORT=9390
+    OPENVAS_USERNAME=admin
+    OPENVAS_PASSWORD=your_gmp_password
+    OPENVAS_SCAN_CONFIG_ID=xxxx
+    OPENVAS_PORT_LIST_ID=xxxx
+    OPENVAS_VERIFY_TLS=false
+
+        # Only for OPENVAS_BACKEND=docker (defaults shown)
+        OPENVAS_COMPOSE_FILE=docker-compose.yml
+        OPENVAS_COMPOSE_SERVICE=gvm-tools
    ```
 
 ## 🚀 Usage
@@ -150,6 +169,41 @@ python vulnerability_scanner.py [source_name]
 ```
 
 Available sources: NVD, CISA, Cisco, Microsoft, Google, Oracle, VMware, IBM, Adobe, HPE
+
+### OpenVAS Integration (Beta)
+
+You can trigger authenticated OpenVAS (GVM) scans without leaving the dashboard. Requirements:
+
+1. A running OpenVAS / GVM stack (GMP reachable via TCP/TLS or via docker compose socket).
+2. API access enabled for a dedicated user.
+3. The `python-gvm` dependency (already included in `requirements.txt`).
+4. Environment variables with your connection details:
+
+   ```env
+    # Recommended on Windows: uses docker compose + gvm-tools + Unix socket
+    OPENVAS_BACKEND=docker
+    OPENVAS_COMPOSE_FILE=docker-compose.yml
+    OPENVAS_COMPOSE_SERVICE=gvm-tools
+
+   OPENVAS_HOST=127.0.0.1
+   OPENVAS_PORT=9390
+   OPENVAS_USERNAME=admin
+   OPENVAS_PASSWORD=your_gmp_password
+   OPENVAS_SCAN_CONFIG_ID=9d9f0d9a-0c8a-11e1-8c3c-406186ea4fc5  # e.g., "Full and fast"
+   OPENVAS_PORT_LIST_ID=33d0cd82-57c6-11e1-8261-406186ea4fc5    # e.g., "All IANA assigned TCP"
+   OPENVAS_VERIFY_TLS=false
+   OPENVAS_TIMEOUT_MINUTES=45
+   OPENVAS_POLL_INTERVAL=30
+   ```
+
+   Retrieve the `SCAN_CONFIG_ID` and `PORT_LIST_ID` with `gvm-cli`:
+
+   ```bash
+   gvm-cli socket --gmp-username admin --gmp-password '***' --xml '<get_scan_configs/>'
+   gvm-cli socket --gmp-username admin --gmp-password '***' --xml '<get_port_lists/>'
+   ```
+
+5. Navigate to the **Scanner → OpenVAS Active Network Scan** panel, supply targets, and launch a scan. Results are filtered by severity, saved to SQLite, and immediately available on the dashboard.
 
 ## 📊 Database Schema
 
@@ -294,7 +348,6 @@ AI prompts can be customized in the `gemini_integration.py` file for different a
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-
 ## 👥 Author
 
 **Bhavesh** - [GitHub](https://github.com/Bhavesh0577)
@@ -302,6 +355,5 @@ AI prompts can be customized in the `gemini_integration.py` file for different a
 ## 🆘 Support
 
 For support, please open an issue on GitHub or contact the development team.
-
 
 **⚠️ Disclaimer**: This tool is for educational and security research purposes. Always follow responsible disclosure practices and comply with applicable laws and regulations when using this software.

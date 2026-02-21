@@ -1,19 +1,25 @@
 import os
+from dotenv import load_dotenv
 import google.generativeai as genai
 from typing import List, Dict, Any, Optional
 import json
 import logging
 
+# Load .env BEFORE reading environment variables
+load_dotenv()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize Gemini with the API key
-API_KEY = os.environ.get("GEMINI_API")  # This should be stored securely in production
+# Initialize Gemini with the API key from environment variable
+API_KEY = os.environ.get("GEMINI_API", "")
+if not API_KEY:
+    logger.warning("GEMINI_API environment variable not set – Gemini features will fail.")
 genai.configure(api_key=API_KEY)
 
-# Use Gemini 2.0 Flash model
-MODEL_NAME = "models/gemini-2.0-flash"  # Using the flash model as specified
+# Use Gemini 2.5 Flash model
+MODEL_NAME = "models/gemini-2.5-flash"  # Using the flash model as specified
 
 class GeminiVulnerabilityAnalyzer:
     """Class to handle vulnerability analysis using Google's Gemini AI."""
@@ -352,4 +358,108 @@ def prioritize_vulnerability_list(vulnerabilities_list, organization_context=Non
 def get_threat_intelligence(cve_id):
     """Function to get enhanced threat intelligence that can be called from the main app"""
     analyzer = GeminiVulnerabilityAnalyzer()
-    return analyzer.generate_threat_intelligence(cve_id) 
+    return analyzer.generate_threat_intelligence(cve_id)
+
+
+# ---------------------------------------------------------------------------
+# Batch mitigation: send ALL vulnerabilities in ONE Gemini request
+# ---------------------------------------------------------------------------
+
+def batch_generate_mitigation_plans(vulnerabilities: List[Dict[str, Any]],
+                                     chunk_size: int = 80) -> Dict[str, str]:
+    """Send all vulnerabilities to Gemini in a single (or few chunked) request(s)
+    and return a dict mapping each CVE-ID to its AI-generated remediation strategy.
+
+    If the list exceeds *chunk_size* the vulnerabilities are split into groups
+    so the prompt stays within model context limits, but even then only a handful
+    of API calls are made instead of one per vulnerability.
+
+    Args:
+        vulnerabilities: List of vulnerability dicts (must contain ``cve_id``).
+        chunk_size: Max number of vulnerabilities per API call (default 80).
+
+    Returns:
+        Dict ``{cve_id: strategy_text}`` for every CVE that was processed.
+    """
+
+    if not vulnerabilities:
+        return {}
+
+    analyzer = GeminiVulnerabilityAnalyzer()
+    all_strategies: Dict[str, str] = {}
+
+    # Split into manageable chunks
+    chunks = [vulnerabilities[i:i + chunk_size]
+              for i in range(0, len(vulnerabilities), chunk_size)]
+
+    for chunk_idx, chunk in enumerate(chunks):
+        # Build a concise table of vulnerabilities for the prompt
+        vuln_entries = []
+        for v in chunk:
+            cve = v.get("cve_id", "")
+            if not cve:
+                continue
+            entry = {
+                "cve_id": cve,
+                "product": v.get("product_name", "N/A"),
+                "version": v.get("product_version", "N/A"),
+                "vendor": v.get("oem_name", "N/A"),
+                "severity": v.get("severity_level", "N/A"),
+                "description": (v.get("vulnerability_description") or "")[:300],
+                "mitigation_hint": (v.get("mitigation_strategy") or "")[:200],
+            }
+            vuln_entries.append(entry)
+
+        if not vuln_entries:
+            continue
+
+        prompt = f"""You are a senior cybersecurity analyst. Below is a JSON array with {len(vuln_entries)} vulnerabilities.
+For EACH vulnerability provide a concise but actionable remediation strategy covering:
+1. Immediate mitigation steps
+2. Long-term remediation approach
+3. Compensating controls if patching is not immediately possible
+
+Return your answer as a JSON object where each key is the CVE-ID and the value is the
+remediation strategy text (plain string, no nested objects). Example:
+{{
+  "CVE-2024-1234": "1. Immediately apply vendor patch ...\\n2. Long-term: upgrade to version ...\\n3. Compensating: restrict network access ...",
+  "CVE-2024-5678": "..."
+}}
+
+IMPORTANT: Return ONLY valid JSON, no markdown fences, no extra text.
+
+VULNERABILITIES:
+{json.dumps(vuln_entries, indent=1)}
+"""
+
+        try:
+            response = analyzer.model.generate_content(prompt)
+            raw_text = response.text.strip()
+
+            # Strip markdown code fences if the model wraps its answer
+            if raw_text.startswith("```"):
+                # Remove opening fence (```json or ```)
+                raw_text = raw_text.split("\n", 1)[1] if "\n" in raw_text else raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3].rstrip()
+
+            strategies = json.loads(raw_text)
+            if isinstance(strategies, dict):
+                all_strategies.update(strategies)
+            else:
+                logger.warning("Gemini returned non-dict JSON for chunk %d", chunk_idx)
+        except json.JSONDecodeError as je:
+            logger.error("Failed to parse batch Gemini response for chunk %d: %s", chunk_idx, je)
+            # Fallback: mark every CVE in this chunk as failed
+            for v in chunk:
+                cve = v.get("cve_id", "")
+                if cve and cve not in all_strategies:
+                    all_strategies[cve] = "AI strategy generation failed (batch parse error)."
+        except Exception as e:
+            logger.error("Gemini batch request failed for chunk %d: %s", chunk_idx, e)
+            for v in chunk:
+                cve = v.get("cve_id", "")
+                if cve and cve not in all_strategies:
+                    all_strategies[cve] = f"AI strategy generation failed: {e}"
+
+    return all_strategies

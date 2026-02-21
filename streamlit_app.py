@@ -1,29 +1,40 @@
+import os
+from dotenv import load_dotenv
+
+# Load .env FIRST, before any project imports that read env vars at module level
+load_dotenv()
+
 import streamlit as st
 import pandas as pd
 import concurrent.futures
 import smtplib
 import plotly.express as px
 import csv
-import os
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 import time
-from dotenv import load_dotenv
 
 # Import functions from the vulnerability scanner module
 from vulnerability_scanner import (
-    setup_database, 
-    scan_source, 
-    OEM_SOURCES, 
+    setup_database,
+    scan_source,
+    OEM_SOURCES,
     get_vulnerabilities,
     add_recipient,
     get_recipients,
     delete_recipient,
-    save_vulnerability_to_db as save_vulnerability
+    save_vulnerability_to_db as save_vulnerability,
+    openvas_supported,
+    scan_openvas_targets,
 )
+
+try:
+    from openvas_integration import OpenVASConfig
+except ImportError:  # pragma: no cover - optional dependency
+    OpenVASConfig = None  # type: ignore
 
 # Import AI integration functions
 from gemini_integration import (
@@ -32,13 +43,9 @@ from gemini_integration import (
     generate_mitigation_plan,
     get_vulnerability_explanation,
     prioritize_vulnerability_list,
-    get_threat_intelligence
+    get_threat_intelligence,
+    batch_generate_mitigation_plans,
 )
-
-# Email configuration
-
-# Load environment variables from .env file
-load_dotenv()
 
 # Email configuration from environment variables with fallbacks
 EMAIL_CONFIG = {
@@ -61,26 +68,36 @@ SOURCES = {
         "type": "api",
         "description": "CISA Known Exploited Vulnerabilities Catalog - Actively exploited vulnerabilities"
     },
-    "Microsoft Security": {
-        "url": "https://api.msrc.microsoft.com/cvrf/v2.0/updates",
+    "Microsoft": {
+        "url": "https://api.msrc.microsoft.com/cvrf/v3.0/updates",
         "type": "api",
-        "description": "Microsoft Security Update Guide"
+        "description": "Microsoft Security Response Center (MSRC) - Patch Tuesday updates"
     },
     "Cisco": {
-        "url": "https://tools.cisco.com/security/center/publicationListing.x",
+        "url": "https://sec.cloudapps.cisco.com/security/center/publicationListing.x",
         "type": "web",
-        "description": "Cisco Security Advisories"
-    },
-     "IBM": {
-        "url": "https://tools.cisco.com/security/center/publicationListing.x",
-        "type": "web",
-        "description": "IBM Security Advisories"
+        "description": "Cisco Security Advisories - Network equipment vulnerabilities"
     },
     "Google": {
         "url": "https://cloud.google.com/support/bulletins",
         "type": "web",
-        "description": "Google Cloud Security Bulletins"
-    }
+        "description": "Google Cloud & Android Security Bulletins"
+    },
+    "Fortinet": {
+        "url": "https://www.fortiguard.com/psirt",
+        "type": "web",
+        "description": "Fortinet FortiGuard PSIRT - FortiGate/FortiOS advisories"
+    },
+    "Palo Alto": {
+        "url": "https://security.paloaltonetworks.com/",
+        "type": "web",
+        "description": "Palo Alto Networks Security Advisories - PAN-OS vulnerabilities"
+    },
+    "Adobe": {
+        "url": "https://helpx.adobe.com/security.html",
+        "type": "web",
+        "description": "Adobe Security Bulletins - Acrobat, Reader, ColdFusion, etc."
+    },
 }
 
 def format_vulnerability_for_email(vulnerability):
@@ -166,9 +183,8 @@ def send_email_notification(vulnerabilities, recipients, include_ai_insights=Fal
         return False
     
     try:
-        # Debug information
-        st.info(f"Attempting to send email using SMTP server: {EMAIL_CONFIG['smtp_server']}")
-        st.info(f"Using sender email: {EMAIL_CONFIG['sender_email']}")
+        # Log connection attempt without exposing credentials
+        st.info("Connecting to SMTP server...")
         
         # Create email message
         msg = MIMEMultipart()
@@ -189,19 +205,27 @@ def send_email_notification(vulnerabilities, recipients, include_ai_insights=Fal
                     cleaned_vuln[key] = value
             cleaned_vulnerabilities.append(cleaned_vuln)
         
-        # Optionally enhance vulnerabilities with AI insights
+        # --- Generate Gemini AI remediation strategies in ONE batch request ---
+        st.info(f"Generating AI remediation strategies via Gemini for {len(cleaned_vulnerabilities)} vulnerabilities (single batch request)...")
+        ai_strategies = {}  # cve_id -> strategy text
+        try:
+            ai_strategies = batch_generate_mitigation_plans(cleaned_vulnerabilities)
+            st.success(f"AI strategies generated for {len(ai_strategies)} vulnerabilities in a single batch.")
+        except Exception as e:
+            st.warning(f"AI batch strategy generation encountered an error: {e}")
+        
+        # Optionally enhance vulnerabilities with deeper AI insights
         if include_ai_insights:
-            st.info("Generating AI insights for email content...")
-            # Limit to first 3 vulnerabilities to avoid overloading the API
-            vulns_to_analyze = cleaned_vulnerabilities[:3]
+            st.info("Generating additional AI insights for email content...")
+            vulns_to_analyze = cleaned_vulnerabilities[:5]
             try:
                 enhanced_vulns = batch_analyze_vulnerabilities(vulns_to_analyze)
-                email_body = generate_ai_enhanced_email_content(enhanced_vulns, len(cleaned_vulnerabilities))
+                email_body = generate_ai_enhanced_email_content(enhanced_vulns, len(cleaned_vulnerabilities), ai_strategies)
             except Exception as e:
                 st.warning(f"Could not generate AI insights: {str(e)}. Falling back to standard email format.")
-                email_body = generate_standard_email_content(cleaned_vulnerabilities)
+                email_body = generate_standard_email_content(cleaned_vulnerabilities, ai_strategies)
         else:
-            email_body = generate_standard_email_content(cleaned_vulnerabilities)
+            email_body = generate_standard_email_content(cleaned_vulnerabilities, ai_strategies)
         
         # Attach HTML content
         msg.attach(MIMEText(email_body, 'html', 'utf-8'))
@@ -293,126 +317,200 @@ def send_email_notification(vulnerabilities, recipients, include_ai_insights=Fal
         st.error(f"Error sending email notification: {str(e)}")
         return False
 
-def generate_standard_email_content(vulnerabilities):
-    """Generate standard email content without AI insights"""
+def _build_summary_table_html(vulnerabilities):
+    """Build an at-a-glance HTML summary table of all reported vulnerabilities."""
+    severity_colors = {
+        'Critical': '#d32f2f', 'High': '#e65100',
+        'Medium': '#f9a825', 'Low': '#388e3c',
+    }
+    rows = ''
+    for idx, v in enumerate(vulnerabilities, 1):
+        sev = v.get('severity_level', 'N/A')
+        color = severity_colors.get(sev, '#555')
+        rows += (
+            f'<tr>'
+            f'<td style="padding:6px 10px;">{idx}</td>'
+            f'<td style="padding:6px 10px;font-family:monospace;">{v.get("cve_id", "N/A")}</td>'
+            f'<td style="padding:6px 10px;color:{color};font-weight:bold;">{sev}</td>'
+            f'<td style="padding:6px 10px;">{v.get("oem_name", "N/A")}</td>'
+            f'<td style="padding:6px 10px;">{v.get("product_name", "N/A")}</td>'
+            f'<td style="padding:6px 10px;">{v.get("published_date", "N/A")}</td>'
+            f'</tr>'
+        )
+    return f'''
+    <h3 style="margin-top:30px;">Report Summary &mdash; All Vulnerabilities ({len(vulnerabilities)})</h3>
+    <table style="border-collapse:collapse;width:100%;border:1px solid #ddd;">
+      <thead>
+        <tr style="background:#1a237e;color:#fff;">
+          <th style="padding:8px 10px;text-align:left;">#</th>
+          <th style="padding:8px 10px;text-align:left;">CVE ID</th>
+          <th style="padding:8px 10px;text-align:left;">Severity</th>
+          <th style="padding:8px 10px;text-align:left;">Vendor</th>
+          <th style="padding:8px 10px;text-align:left;">Product</th>
+          <th style="padding:8px 10px;text-align:left;">Published</th>
+        </tr>
+      </thead>
+      <tbody>{rows}</tbody>
+    </table>
+    '''
+
+
+def generate_standard_email_content(vulnerabilities, ai_strategies=None):
+    """Generate standard email content with Gemini AI remediation strategies."""
+    ai_strategies = ai_strategies or {}
+
     email_body = f'''
 <html>
 <head>
   <style>
-    body {{ font-family: Arial, sans-serif; }}
+    body {{ font-family: Arial, sans-serif; color: #222; }}
     table {{ border-collapse: collapse; width: 100%; }}
     td {{ padding: 8px; vertical-align: top; }}
     tr:nth-child(even) {{ background-color: #f2f2f2; }}
+    .ai-strategy {{ background:#e8f5e9; padding:12px 15px; margin:8px 0; border-left:4px solid #2e7d32;
+                     font-size:14px; white-space:pre-wrap; }}
+    .vuln-card {{ border:1px solid #ccc; border-radius:6px; padding:16px; margin:18px 0;
+                  box-shadow:0 2px 4px rgba(0,0,0,.08); }}
   </style>
 </head>
 <body>
-  <h2>Critical/High Severity Vulnerability Alert</h2>
-  <p>The following {len(vulnerabilities)} new critical or high severity vulnerabilities have been detected:</p>
-  <table>
+  <h2 style="color:#c62828;">&#x1F6A8; Critical/High Severity Vulnerability Alert</h2>
+  <p>The following <strong>{len(vulnerabilities)}</strong> new critical or high severity vulnerabilities have been detected.</p>
 '''
-    
-    # Add each vulnerability to the email body
+
+    # --- Summary report table ---
+    email_body += _build_summary_table_html(vulnerabilities)
+
+    # --- Detailed section per vulnerability ---
+    email_body += '<h3 style="margin-top:30px;">Detailed Findings &amp; AI Remediation Strategies</h3>'
+
     for vuln in vulnerabilities:
+        cve = vuln.get('cve_id', 'N/A')
+        strategy_html = ''
+        strategy_text = ai_strategies.get(cve)
+        if strategy_text:
+            safe_strategy = (strategy_text
+                             .replace('&', '&amp;')
+                             .replace('<', '&lt;')
+                             .replace('>', '&gt;'))
+            strategy_html = f'''
+        <tr>
+          <td colspan="2">
+            <div class="ai-strategy">
+              <strong>&#x1F916; AI-Powered Remediation Strategy (Gemini):</strong><br/>
+              {safe_strategy}
+            </div>
+          </td>
+        </tr>'''
+
+        email_body += f'<div class="vuln-card"><table width="100%">'
         email_body += format_vulnerability_for_email(vuln)
-    
+        email_body += strategy_html
+        email_body += '</table></div>'
+
     email_body += '''
-  </table>
-  <p>Please take immediate action to address these vulnerabilities.</p>
+  <p style="margin-top:20px;">Please take immediate action to address these vulnerabilities.<br/>
+  <em>AI strategies powered by Google Gemini.</em></p>
 </body>
 </html>
 '''
     return email_body
 
-def generate_ai_enhanced_email_content(enhanced_vulnerabilities, total_count):
-    """Generate enhanced email content with AI insights"""
+def generate_ai_enhanced_email_content(enhanced_vulnerabilities, total_count, ai_strategies=None):
+    """Generate enhanced email content with AI insights and Gemini remediation strategies."""
+    ai_strategies = ai_strategies or {}
+
+    # Build a combined list for the summary table (enhanced vulns may be a subset)
     email_body = f'''
 <html>
 <head>
   <style>
-    body {{ font-family: Arial, sans-serif; }}
+    body {{ font-family: Arial, sans-serif; color: #222; }}
     table {{ border-collapse: collapse; width: 100%; }}
     td {{ padding: 8px; vertical-align: top; }}
     tr:nth-child(even) {{ background-color: #f2f2f2; }}
     .ai-insights {{ background-color: #f0f7ff; padding: 15px; margin: 10px 0; border-left: 5px solid #0078d4; }}
+    .ai-strategy {{ background:#e8f5e9; padding:12px 15px; margin:8px 0; border-left:4px solid #2e7d32;
+                     font-size:14px; white-space:pre-wrap; }}
     .ai-summary {{ font-style: italic; color: #333; }}
     .ai-impact {{ color: #d83b01; }}
     .ai-actions {{ color: #107c10; }}
+    .vuln-card {{ border:1px solid #ccc; border-radius:6px; padding:16px; margin:18px 0;
+                  box-shadow:0 2px 4px rgba(0,0,0,.08); }}
   </style>
 </head>
 <body>
-  <h2>AI-Enhanced Critical/High Severity Vulnerability Alert</h2>
-  <p>The following {total_count} new critical or high severity vulnerabilities have been detected. 
-  AI analysis has been provided for the most critical items below:</p>
-'''
-    
-    # Add enhanced vulnerabilities with AI insights
-    for vuln in enhanced_vulnerabilities:
-        # Get AI insights if available
-        ai_insights = vuln.get("ai_insights", {})
-        has_insights = "error" not in ai_insights and ai_insights
-        
-        email_body += f'''
-<div style="margin: 20px 0; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-  <h3>{vuln.get('cve_id', 'Unknown CVE')} - {vuln.get('product_name', 'Unknown Product')}</h3>
-  <table width="100%">
-    <tr>
-      <td width="150"><strong>Severity:</strong></td>
-      <td>{vuln.get('severity_level', 'Unknown')}</td>
-    </tr>
-    <tr>
-      <td><strong>Product:</strong></td>
-      <td>{vuln.get('product_name', 'N/A')} {vuln.get('product_version', '')}</td>
-    </tr>
-    <tr>
-      <td><strong>Vendor:</strong></td>
-      <td>{vuln.get('oem_name', 'N/A')}</td>
-    </tr>
-    <tr>
-      <td><strong>Published:</strong></td>
-      <td>{vuln.get('published_date', 'N/A')}</td>
-    </tr>
-    <tr>
-      <td><strong>Description:</strong></td>
-      <td>{vuln.get('vulnerability_description', 'N/A')}</td>
-    </tr>
+  <h2 style="color:#c62828;">&#x1F916; AI-Enhanced Critical/High Severity Vulnerability Alert</h2>
+  <p>The following <strong>{total_count}</strong> new critical or high severity vulnerabilities have been detected.
+  AI analysis and Gemini-powered remediation strategies are included below.</p>
 '''
 
-        # Add AI insights if available
+    # --- Summary report table ---
+    email_body += _build_summary_table_html(enhanced_vulnerabilities)
+
+    email_body += '<h3 style="margin-top:30px;">Detailed Findings, AI Insights &amp; Remediation Strategies</h3>'
+
+    # Add enhanced vulnerabilities with AI insights
+    for vuln in enhanced_vulnerabilities:
+        cve = vuln.get('cve_id', 'Unknown CVE')
+        ai_insights = vuln.get("ai_insights", {})
+        has_insights = "error" not in ai_insights and ai_insights
+
+        email_body += f'<div class="vuln-card">'
+        email_body += f'<h3>{cve} &mdash; {vuln.get("product_name", "Unknown Product")}</h3>'
+        email_body += '<table width="100%">'
+        email_body += f'''
+    <tr><td width="150"><strong>Severity:</strong></td><td>{vuln.get('severity_level', 'Unknown')}</td></tr>
+    <tr><td><strong>Product:</strong></td><td>{vuln.get('product_name', 'N/A')} {vuln.get('product_version', '')}</td></tr>
+    <tr><td><strong>Vendor:</strong></td><td>{vuln.get('oem_name', 'N/A')}</td></tr>
+    <tr><td><strong>Published:</strong></td><td>{vuln.get('published_date', 'N/A')}</td></tr>
+    <tr><td><strong>Description:</strong></td><td>{vuln.get('vulnerability_description', 'N/A')}</td></tr>
+'''
+
+        # AI insights block
         if has_insights:
             summary = ai_insights.get("summary", "No AI summary available")
             business_impact = ai_insights.get("business_impact", "No business impact analysis available")
             recommended_actions = ai_insights.get("recommended_actions", "No recommended actions available")
-            
             email_body += f'''
-    <tr>
-      <td colspan="2">
-        <div class="ai-insights">
-          <h4>AI Analysis</h4>
-          <p class="ai-summary"><strong>Summary:</strong> {summary}</p>
-          <p class="ai-impact"><strong>Business Impact:</strong> {business_impact}</p>
-          <p class="ai-actions"><strong>Recommended Actions:</strong> {recommended_actions}</p>
-        </div>
-      </td>
-    </tr>
+    <tr><td colspan="2">
+      <div class="ai-insights">
+        <h4>&#x1F4CA; AI Analysis</h4>
+        <p class="ai-summary"><strong>Summary:</strong> {summary}</p>
+        <p class="ai-impact"><strong>Business Impact:</strong> {business_impact}</p>
+        <p class="ai-actions"><strong>Recommended Actions:</strong> {recommended_actions}</p>
+      </div>
+    </td></tr>
 '''
-        
+
+        # Gemini remediation strategy block
+        strategy_text = ai_strategies.get(cve)
+        if strategy_text:
+            safe_strategy = (strategy_text
+                             .replace('&', '&amp;')
+                             .replace('<', '&lt;')
+                             .replace('>', '&gt;'))
+            email_body += f'''
+    <tr><td colspan="2">
+      <div class="ai-strategy">
+        <strong>&#x1F916; Gemini Remediation Strategy:</strong><br/>
+        {safe_strategy}
+      </div>
+    </td></tr>
+'''
+
         email_body += f'''
-    <tr>
-      <td><strong>Reference:</strong></td>
-      <td><a href="{vuln.get('url', '#')}">{vuln.get('url', 'N/A')}</a></td>
-    </tr>
-  </table>
-</div>
+    <tr><td><strong>Reference:</strong></td>
+      <td><a href="{vuln.get('url', '#')}">{vuln.get('url', 'N/A')}</a></td></tr>
+  </table></div>
 '''
-    
-    # Add note about remaining vulnerabilities if there are more
+
     if total_count > len(enhanced_vulnerabilities):
-        email_body += f'''
-<p>Plus {total_count - len(enhanced_vulnerabilities)} additional vulnerabilities. See the attached CSV file for complete details.</p>
-'''
-    
+        email_body += f'<p>Plus {total_count - len(enhanced_vulnerabilities)} additional vulnerabilities. See the attached CSV file for complete details.</p>'
+
     email_body += '''
-  <p>Please prioritize these vulnerabilities based on the AI-provided insights and your specific environment.</p>
+  <p style="margin-top:20px;">Please prioritize these vulnerabilities based on the AI-provided insights and your specific environment.<br/>
+  <em>Analysis powered by Google Gemini.</em></p>
 </body>
 </html>
 '''
@@ -429,8 +527,17 @@ def export_to_csv(vulnerabilities, filename="vulnerabilities.csv"):
         return None
 
 def plot_severity_distribution(vulnerabilities):
-    """Create a pie chart of vulnerability severity levels"""
+    """Create a donut chart of vulnerability severity levels"""
     df = pd.DataFrame(vulnerabilities)
+    # Normalize severity to valid values only
+    valid_severities = {'Critical', 'High', 'Medium', 'Low'}
+    sev_map = {
+        'critical': 'Critical', 'high': 'High', 'medium': 'Medium', 'low': 'Low',
+        'important': 'High', 'moderate': 'Medium', 'informational': 'Low',
+    }
+    df['severity_level'] = df['severity_level'].astype(str).str.strip().str.lower().map(
+        lambda s: sev_map.get(s, next((v for k, v in sev_map.items() if k in s), 'Medium'))
+    )
     severity_counts = df['severity_level'].value_counts().reset_index()
     severity_counts.columns = ['Severity', 'Count']
     
@@ -438,96 +545,565 @@ def plot_severity_distribution(vulnerabilities):
         severity_counts, 
         values='Count', 
         names='Severity', 
-        title='Vulnerability Severity Distribution',
+        title='Severity Breakdown',
         color='Severity',
         color_discrete_map={
-            'Critical': '#FF0000',
-            'High': '#FFA500',
-            'Medium': '#FFFF00',
-            'Low': '#00FF00'
-        }
+            'Critical': '#f85149',
+            'High': '#d29922',
+            'Medium': '#e3b341',
+            'Low': '#3fb950'
+        },
+        hole=0.5,
     )
+    fig.update_layout(
+        margin=dict(t=36, b=16, l=16, r=16),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5,
+                    font=dict(size=11, color="#8b949e")),
+        font=dict(family="Inter, sans-serif", size=12, color="#e6edf3"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        title_font=dict(size=14, color="#e6edf3"),
+    )
+    fig.update_traces(textposition='inside', textinfo='percent+label',
+                      marker=dict(line=dict(color='#161b22', width=2)))
     return fig
 
 def plot_oem_distribution(vulnerabilities):
-    """Create a bar chart of vulnerabilities by OEM"""
+    """Create a horizontal bar chart of vulnerabilities by vendor"""
     df = pd.DataFrame(vulnerabilities)
     oem_counts = df['oem_name'].value_counts().reset_index()
-    oem_counts.columns = ['OEM', 'Count']
+    oem_counts.columns = ['Vendor', 'Count']
+    oem_counts = oem_counts.sort_values('Count', ascending=True)
     
     fig = px.bar(
         oem_counts, 
-        x='OEM', 
-        y='Count', 
-        title='Vulnerabilities by OEM',
-        color='Count',
-        color_continuous_scale=px.colors.sequential.Reds
+        y='Vendor', 
+        x='Count', 
+        title='By Vendor',
+        orientation='h',
+        text='Count',
+    )
+    fig.update_traces(
+        marker_color='#58a6ff',
+        textposition='outside',
+        textfont=dict(color="#8b949e", size=11),
+    )
+    fig.update_layout(
+        margin=dict(t=36, b=16, l=16, r=30),
+        showlegend=False,
+        font=dict(family="Inter, sans-serif", size=12, color="#e6edf3"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        title_font=dict(size=14, color="#e6edf3"),
+        xaxis=dict(showgrid=True, gridcolor="#21262d", zeroline=False),
+        yaxis=dict(showgrid=False),
     )
     return fig
 
 def plot_time_series(vulnerabilities):
-    """Create a time series line chart of vulnerabilities discovered over time"""
+    """Create an area chart of vulnerabilities over time"""
     df = pd.DataFrame(vulnerabilities)
     if 'published_date' not in df.columns:
         return None
-    # Parse dates
-    df['published_date'] = pd.to_datetime(df['published_date'], errors='coerce')
-    # Drop NaT
+    # Strip whitespace / empty strings before conversion so they become NaT
+    df['published_date'] = df['published_date'].astype(str).str.strip().replace('', pd.NaT)
+    df['published_date'] = pd.to_datetime(df['published_date'], errors='coerce', utc=True)
+    df['published_date'] = df['published_date'].dt.tz_localize(None)  # drop tz so groupby works cleanly
     df = df.dropna(subset=['published_date'])
-    # Group by date
-    time_counts = df.groupby(df['published_date'].dt.date).size().reset_index(name='Count')
-    fig = px.line(
+    if df.empty:
+        return None
+    time_counts = df.groupby(df['published_date'].dt.normalize()).size().reset_index(name='Count')
+    fig = px.area(
         time_counts,
         x='published_date',
         y='Count',
-        title='Vulnerabilities Discovered Over Time',
-        markers=True
+        title='Timeline',
+        markers=True,
     )
-    fig.update_xaxes(title='Date')
-    fig.update_yaxes(title='Number of Vulnerabilities')
+    fig.update_traces(
+        line_color='#58a6ff',
+        fillcolor='rgba(56,139,253,.12)',
+        marker=dict(size=5, color='#58a6ff'),
+    )
+    fig.update_layout(
+        margin=dict(t=36, b=16, l=16, r=16),
+        font=dict(family="Inter, sans-serif", size=12, color="#e6edf3"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        title_font=dict(size=14, color="#e6edf3"),
+        xaxis=dict(title="", showgrid=True, gridcolor="#21262d"),
+        yaxis=dict(title="Count", showgrid=True, gridcolor="#21262d"),
+    )
     return fig
 
 def plot_oem_severity_heatmap(vulnerabilities):
-    """Create a heatmap of vulnerabilities by OEM and severity"""
+    """Create a heatmap of vulnerabilities by vendor and severity"""
     df = pd.DataFrame(vulnerabilities)
     if 'oem_name' not in df.columns or 'severity_level' not in df.columns:
         return None
     pivot = pd.pivot_table(df, index='oem_name', columns='severity_level', aggfunc='size', fill_value=0)
+    if pivot.empty:
+        return None
     fig = px.imshow(
         pivot,
-        labels=dict(x="Severity", y="OEM", color="Count"),
-        title="OEM vs. Severity Heatmap",
+        labels=dict(x="Severity", y="Vendor", color="Count"),
+        title="Vendor / Severity",
         aspect="auto",
-        color_continuous_scale=px.colors.sequential.Blues
+        color_continuous_scale=[[0, '#161b22'], [0.5, '#1f4a6f'], [1, '#58a6ff']],
+    )
+    fig.update_layout(
+        margin=dict(t=36, b=16, l=16, r=16),
+        font=dict(family="Inter, sans-serif", size=12, color="#e6edf3"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        title_font=dict(size=14, color="#e6edf3"),
+        coloraxis_colorbar=dict(thickness=12, len=0.6),
     )
     return fig
 
+
+def render_openvas_section():
+    """Render the OpenVAS active scanning section on the Scanner page."""
+
+    st.subheader("🛡️ OpenVAS Active Network Scan (Beta)")
+    st.caption("Run authenticated OpenVAS/GVM scans directly from this dashboard.")
+
+    if OpenVASConfig is None or not openvas_supported():
+        st.info(
+            "OpenVAS integration is unavailable. Install dependencies and configure the OpenVAS environment"
+            " variables. On Windows, set OPENVAS_BACKEND=docker and ensure Docker Desktop is running."
+        )
+        return
+
+    def _env_int(name: str, fallback: int) -> int:
+        try:
+            raw = os.getenv(name, "").strip()
+            return int(raw) if raw else fallback
+        except ValueError:
+            return fallback
+
+    default_scan_name = f"Streamlit Scan {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    timeout_default = _env_int("OPENVAS_TIMEOUT_MINUTES", 45)
+    poll_default = _env_int("OPENVAS_POLL_INTERVAL", 30)
+    port_default = _env_int("OPENVAS_PORT", 9390)
+
+    with st.form("openvas_scan_form"):
+        targets_input = st.text_area(
+            "Target hosts or IPs",
+            placeholder="192.168.1.10\nweb.example.com",
+            help="Specify one target per line. CIDR ranges are supported if enabled on your GVM server.",
+        )
+        scan_name = st.text_input("Scan name", value=default_scan_name)
+
+        col1, col2 = st.columns(2)
+        host = col1.text_input("OpenVAS host", value=os.getenv("OPENVAS_HOST", "127.0.0.1"))
+        port = col2.number_input("GMP port", min_value=1, max_value=65535, value=port_default, step=1)
+
+        col3, col4 = st.columns(2)
+        username = col3.text_input("OpenVAS username", value=os.getenv("OPENVAS_USERNAME", ""))
+        password = col4.text_input("OpenVAS password", value=os.getenv("OPENVAS_PASSWORD", ""), type="password")
+
+        col5, col6 = st.columns(2)
+        scan_config_id = col5.text_input(
+            "Scan config ID",
+            value=os.getenv("OPENVAS_SCAN_CONFIG_ID", ""),
+            help="Use `gvm-cli --xml '<get_scan_configs/>'` to locate the ID for profiles such as Full and Fast.",
+        )
+        port_list_id = col6.text_input(
+            "Port list ID",
+            value=os.getenv("OPENVAS_PORT_LIST_ID", ""),
+            help="List available port lists with `gvm-cli --xml '<get_port_lists/>'`.",
+        )
+
+        severity_filter = st.multiselect(
+            "Keep severities",
+            options=["Critical", "High", "Medium", "Low"],
+            default=["Critical", "High"],
+        )
+        verify_tls = st.checkbox(
+            "Verify TLS certificates",
+            value=os.getenv("OPENVAS_VERIFY_TLS", "false").lower() == "true",
+        )
+        timeout_minutes = st.slider(
+            "Wait timeout (minutes)",
+            min_value=5,
+            max_value=120,
+            value=timeout_default,
+        )
+        poll_interval = st.slider(
+            "Status refresh interval (seconds)",
+            min_value=10,
+            max_value=120,
+            value=poll_default,
+        )
+
+        submitted = st.form_submit_button("Run OpenVAS Scan")
+
+    if not submitted:
+        return
+
+    targets = [line.strip() for line in targets_input.splitlines() if line.strip()]
+    if not targets:
+        st.error("Provide at least one host or IP address to scan.")
+        return
+
+    required_values = [host, username, password, scan_config_id, port_list_id]
+    if any(not value.strip() for value in required_values):
+        st.error("Host, credentials, scan config ID, and port list ID are required for OpenVAS scans.")
+        return
+
+    config = OpenVASConfig(
+        host=host.strip(),
+        port=int(port),
+        username=username.strip(),
+        password=password,
+        scan_config_id=scan_config_id.strip(),
+        port_list_id=port_list_id.strip(),
+        verify_tls=verify_tls,
+        timeout_seconds=timeout_minutes * 60,
+        poll_interval=poll_interval,
+    )
+
+    with st.spinner("Running OpenVAS scan. This can take several minutes depending on the profile and targets..."):
+        try:
+            new_findings, scan_meta = scan_openvas_targets(
+                targets,
+                scan_name=scan_name.strip() or None,
+                custom_config=config,
+                severity_filter=severity_filter,
+            )
+        except Exception as exc:
+            st.error(f"OpenVAS scan failed: {exc}")
+            return
+
+    persisted_count = len(new_findings)
+    total_report_findings = len(scan_meta.vulnerabilities)
+    if persisted_count:
+        st.success(
+            f"OpenVAS completed. {persisted_count} new finding(s) saved to the database "
+            f"({total_report_findings} findings reported before filtering/deduplication)."
+        )
+        st.session_state.scan_results.extend(new_findings)
+        st.session_state.has_new_results = True
+        st.dataframe(pd.DataFrame(new_findings), use_container_width=True)
+    else:
+        st.info(
+            "OpenVAS scan finished but no new findings met the selected severity filter or they already existed "
+            "in the database."
+        )
+
+    with st.expander("OpenVAS scan metadata"):
+        st.write(
+            {
+                "task_id": scan_meta.task_id,
+                "report_id": scan_meta.report_id,
+                "scan_name": scan_meta.scan_name,
+                "duration_seconds": round(scan_meta.duration_seconds, 1),
+                "targets": targets,
+            }
+        )
+
 def main():
     st.set_page_config(
-        page_title="OEM Vulnerability Scanner",
-        page_icon="🔒",
+        page_title="VulnGuard — Vulnerability Management",
+        page_icon="🛡️",
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    
-    # Initialize session state for storing scan results
+
+    # ── Professional Dark Theme CSS ────────────────────────────────────
+    st.markdown("""
+    <style>
+    /* ===== Imports ===== */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+    /* ===== Root Variables ===== */
+    :root {
+        --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        --bg-primary: #0f1318;
+        --bg-secondary: #161b22;
+        --bg-card: #1c2128;
+        --bg-elevated: #22272e;
+        --border: #30363d;
+        --border-subtle: #21262d;
+        --text-primary: #e6edf3;
+        --text-secondary: #8b949e;
+        --text-muted: #6e7681;
+        --accent: #58a6ff;
+        --accent-subtle: rgba(56,139,253,.15);
+        --red: #f85149;
+        --red-subtle: rgba(248,81,73,.15);
+        --orange: #d29922;
+        --orange-subtle: rgba(210,153,34,.15);
+        --green: #3fb950;
+        --green-subtle: rgba(63,185,80,.15);
+        --yellow: #e3b341;
+        --yellow-subtle: rgba(227,179,65,.15);
+        --purple: #bc8cff;
+    }
+
+    /* ===== Global Reset ===== */
+    html, body, [class*="css"] {
+        font-family: var(--font) !important;
+    }
+    .main .block-container {
+        padding-top: 1.5rem;
+        max-width: 1280px;
+    }
+    footer { visibility: hidden; }
+    header[data-testid="stHeader"] {
+        background: var(--bg-primary);
+        border-bottom: 1px solid var(--border);
+    }
+
+    /* ===== Sidebar ===== */
+    section[data-testid="stSidebar"] {
+        background: var(--bg-secondary);
+        border-right: 1px solid var(--border);
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+        padding-top: 1.2rem;
+    }
+    section[data-testid="stSidebar"] .stMarkdown h1,
+    section[data-testid="stSidebar"] .stMarkdown h2,
+    section[data-testid="stSidebar"] .stMarkdown h3 {
+        color: var(--text-primary) !important;
+        font-weight: 600;
+    }
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] .stMarkdown span,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] .stRadio label {
+        color: var(--text-secondary) !important;
+    }
+    section[data-testid="stSidebar"] hr {
+        border-color: var(--border);
+        margin: .8rem 0;
+    }
+    section[data-testid="stSidebar"] .stRadio > div {
+        gap: 2px;
+    }
+    section[data-testid="stSidebar"] .stRadio label {
+        padding: .55rem .8rem;
+        border-radius: 6px;
+        transition: background .15s;
+        font-size: .9rem;
+    }
+    section[data-testid="stSidebar"] .stRadio label:hover {
+        background: var(--bg-elevated);
+    }
+    section[data-testid="stSidebar"] .stRadio label[data-checked="true"],
+    section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label[aria-checked="true"] {
+        background: var(--accent-subtle);
+        color: var(--accent) !important;
+        font-weight: 500;
+    }
+
+    /* ===== Header Banner ===== */
+    .vg-header {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 1.5rem 2rem;
+        margin-bottom: 1.5rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }
+    .vg-header-icon {
+        width: 48px; height: 48px;
+        background: var(--accent-subtle);
+        border-radius: 10px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 1.5rem; flex-shrink: 0;
+    }
+    .vg-header h1 {
+        margin: 0; font-size: 1.45rem; font-weight: 700;
+        color: var(--text-primary); letter-spacing: -.3px;
+    }
+    .vg-header p {
+        margin: .15rem 0 0 0; font-size: .85rem;
+        color: var(--text-secondary); line-height: 1.3;
+    }
+
+    /* ===== KPI Metric Cards ===== */
+    .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: .85rem;
+        margin-bottom: 1.5rem;
+    }
+    .kpi {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 1.1rem 1.3rem;
+        display: flex;
+        align-items: center;
+        gap: .9rem;
+        transition: border-color .15s;
+    }
+    .kpi:hover { border-color: var(--accent); }
+    .kpi-dot {
+        width: 40px; height: 40px;
+        border-radius: 8px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 1.1rem; flex-shrink: 0;
+    }
+    .kpi-dot-blue   { background: var(--accent-subtle); color: var(--accent); }
+    .kpi-dot-red    { background: var(--red-subtle); color: var(--red); }
+    .kpi-dot-orange { background: var(--orange-subtle); color: var(--orange); }
+    .kpi-dot-green  { background: var(--green-subtle); color: var(--green); }
+    .kpi-num {
+        font-size: 1.55rem; font-weight: 700; line-height: 1;
+        color: var(--text-primary);
+    }
+    .kpi-lbl {
+        font-size: .73rem; font-weight: 500; text-transform: uppercase;
+        letter-spacing: .6px; color: var(--text-muted); margin-top: 2px;
+    }
+
+    /* ===== Page Section Title ===== */
+    .pg-title {
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        padding-bottom: .45rem;
+        margin-bottom: 1rem;
+        border-bottom: 2px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+    }
+    .pg-title .pg-icon {
+        width: 28px; height: 28px;
+        border-radius: 6px;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: .85rem;
+        background: var(--accent-subtle);
+    }
+
+    /* ===== Empty State ===== */
+    .empty-state {
+        text-align: center;
+        padding: 4rem 1rem;
+        color: var(--text-secondary);
+    }
+    .empty-state .empty-icon {
+        width: 56px; height: 56px;
+        background: var(--bg-elevated);
+        border-radius: 50%;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 1.5rem; margin-bottom: 1rem;
+        border: 1px solid var(--border);
+    }
+    .empty-state h3 {
+        color: var(--text-primary); margin: 0 0 .3rem 0; font-size: 1.05rem;
+    }
+    .empty-state p { font-size: .87rem; margin: 0; }
+
+    /* ===== Data tables ===== */
+    div[data-testid="stDataFrame"] {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+    }
+
+    /* ===== Tabs ===== */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2px;
+        border-bottom: 1px solid var(--border);
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 6px 6px 0 0;
+        padding: .55rem 1.1rem;
+        font-weight: 500;
+        font-size: .88rem;
+    }
+
+    /* ===== Dividers ===== */
+    hr {
+        border-color: var(--border) !important;
+        margin: 1.2rem 0 !important;
+    }
+
+    /* ===== Buttons ===== */
+    .stButton > button {
+        border-radius: 6px;
+        font-weight: 500;
+        font-size: .85rem;
+        padding: .45rem 1rem;
+        border: 1px solid var(--border);
+        transition: all .15s;
+    }
+    .stButton > button:hover {
+        border-color: var(--accent);
+        color: var(--accent);
+    }
+    .stButton > button[kind="primary"],
+    .stButton > button[data-testid="stFormSubmitButton"] {
+        background: var(--accent);
+        color: white;
+        border-color: var(--accent);
+    }
+
+    /* ===== Forms / inputs ===== */
+    .stTextInput > div > div > input,
+    .stTextArea textarea,
+    .stNumberInput > div > div > input {
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        font-size: .88rem;
+    }
+    .stMultiSelect > div {
+        border-radius: 6px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Initialize session state
     if 'scan_results' not in st.session_state:
         st.session_state.scan_results = []
     if 'has_new_results' not in st.session_state:
         st.session_state.has_new_results = False
     if 'last_page' not in st.session_state:
         st.session_state.last_page = None
-    
-    st.title("🔒 OEM Vulnerability Scanner")
-    st.subheader("Real-time Critical Vulnerability Detection & Notification")
-    
+
+    # ── Header ─────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="vg-header">
+        <div class="vg-header-icon">🛡️</div>
+        <div>
+            <h1>VulnGuard</h1>
+            <p>Enterprise Vulnerability Detection &amp; AI-Powered Analysis</p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
     # Initialize database
     setup_database()
-    
-    # Sidebar navigation
-    st.sidebar.title("Navigation")
+
+    # ── Sidebar ────────────────────────────────────────────────────────
+    st.sidebar.markdown("### Navigation")
     pages = ["Dashboard", "Scanner", "Email Notifications", "Settings", "AI Analysis"]
-    selection = st.sidebar.radio("Go to", pages)
+    _page_labels = {
+        "Dashboard": "Dashboard",
+        "Scanner": "Scanner",
+        "Email Notifications": "Notifications",
+        "Settings": "Settings",
+        "AI Analysis": "AI Analysis",
+    }
+    selection = st.sidebar.radio(
+        "Page",
+        pages,
+        format_func=lambda p: _page_labels[p],
+        label_visibility="collapsed",
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        "<span style='font-size:.75rem;color:var(--text-muted);'>Gemini AI &middot; OpenVAS &middot; v2.0</span>",
+        unsafe_allow_html=True,
+    )
     
     # Reset scan results when changing from Scanner to another page
     if st.session_state.last_page == "Scanner" and selection != "Scanner":
@@ -538,53 +1114,86 @@ def main():
     st.session_state.last_page = selection
     
     if selection == "Dashboard":
-        st.header("Vulnerability Dashboard")
+        st.markdown('<div class="pg-title"><span class="pg-icon">📊</span> Dashboard</div>', unsafe_allow_html=True)
         
         # Get vulnerabilities from database
         all_vulnerabilities = get_vulnerabilities()
         
         if all_vulnerabilities:
-            # Show stats
-            col1, col2, col3, col4 = st.columns(4)
-            
+            # Compute stats
             all_vulns_count = len(all_vulnerabilities)
             critical_vulns = sum(1 for v in all_vulnerabilities if v['severity_level'] == 'Critical')
             high_vulns = sum(1 for v in all_vulnerabilities if v['severity_level'] == 'High')
+            medium_vulns = sum(1 for v in all_vulnerabilities if v['severity_level'] == 'Medium')
             oem_count = len(set(v['oem_name'] for v in all_vulnerabilities))
+
+            # ── KPI Cards ──
+            st.markdown(f"""
+            <div class="kpi-grid">
+                <div class="kpi">
+                    <div class="kpi-dot kpi-dot-blue">■</div>
+                    <div>
+                        <div class="kpi-num">{all_vulns_count}</div>
+                        <div class="kpi-lbl">Total</div>
+                    </div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-dot kpi-dot-red">●</div>
+                    <div>
+                        <div class="kpi-num">{critical_vulns}</div>
+                        <div class="kpi-lbl">Critical</div>
+                    </div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-dot kpi-dot-orange">▲</div>
+                    <div>
+                        <div class="kpi-num">{high_vulns}</div>
+                        <div class="kpi-lbl">High</div>
+                    </div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-dot kpi-dot-green">◆</div>
+                    <div>
+                        <div class="kpi-num">{oem_count}</div>
+                        <div class="kpi-lbl">Vendors</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
             
-            col1.metric("Total Vulnerabilities", all_vulns_count)
-            col2.metric("Critical Vulnerabilities", critical_vulns)
-            col3.metric("High Vulnerabilities", high_vulns)
-            col4.metric("OEMs Affected", oem_count)
+            # ── Charts ──
+            st.markdown("---")
+            chart_col1, chart_col2 = st.columns(2)
             
-            # Charts
-            col1, col2 = st.columns(2)
+            with chart_col1:
+                with st.container():
+                    severity_chart = plot_severity_distribution(all_vulnerabilities)
+                    st.plotly_chart(severity_chart, use_container_width=True)
             
-            with col1:
-                severity_chart = plot_severity_distribution(all_vulnerabilities)
-                st.plotly_chart(severity_chart, use_container_width=True)
+            with chart_col2:
+                with st.container():
+                    oem_chart = plot_oem_distribution(all_vulnerabilities)
+                    st.plotly_chart(oem_chart, use_container_width=True)
             
-            with col2:
-                oem_chart = plot_oem_distribution(all_vulnerabilities)
-                st.plotly_chart(oem_chart, use_container_width=True)
+            chart_col3, chart_col4 = st.columns(2)
+            with chart_col3:
+                with st.container():
+                    time_series_chart = plot_time_series(all_vulnerabilities)
+                    if time_series_chart:
+                        st.plotly_chart(time_series_chart, use_container_width=True)
+                    else:
+                        st.info("Not enough date data for time series chart.")
+            with chart_col4:
+                with st.container():
+                    heatmap_chart = plot_oem_severity_heatmap(all_vulnerabilities)
+                    if heatmap_chart:
+                        st.plotly_chart(heatmap_chart, use_container_width=True)
+                    else:
+                        st.info("Not enough data for OEM vs. Severity heatmap.")
             
-            # --- New analytics row ---
-            col3, col4 = st.columns(2)
-            with col3:
-                time_series_chart = plot_time_series(all_vulnerabilities)
-                if time_series_chart:
-                    st.plotly_chart(time_series_chart, use_container_width=True)
-                else:
-                    st.info("Not enough date data for time series chart.")
-            with col4:
-                heatmap_chart = plot_oem_severity_heatmap(all_vulnerabilities)
-                if heatmap_chart:
-                    st.plotly_chart(heatmap_chart, use_container_width=True)
-                else:
-                    st.info("Not enough data for OEM vs. Severity heatmap.")
-            
-            # Filter vulnerabilities
-            st.subheader("Filter Vulnerabilities")
+            # ── Filter Section ──
+            st.markdown("---")
+            st.markdown('<div class="pg-title"><span class="pg-icon">🔎</span> Filter</div>', unsafe_allow_html=True)
             
             # Create filters
             col1, col2, col3 = st.columns(3)
@@ -623,7 +1232,7 @@ def main():
                 filtered_df = filtered_df[filtered_df['cve_id'].str.contains(cve_search, case=False, na=False)]
             
             # Display filtered vulnerabilities
-            st.subheader(f"Vulnerabilities ({len(filtered_df)} results)")
+            st.markdown(f'<div class="pg-title"><span class="pg-icon">📋</span> Results &mdash; {len(filtered_df)} found</div>', unsafe_allow_html=True)
             
             # Add columns to display additional CISA-specific information if available
             if not filtered_df.empty:
@@ -823,17 +1432,23 @@ def main():
             else:
                 st.info("No vulnerabilities match your selected filters.")
         else:
-            st.info("No vulnerabilities found in the database. Use the Scanner to find vulnerabilities.")
+            st.markdown("""
+            <div class="empty-state">
+                <div class="empty-icon">📭</div>
+                <h3>No vulnerabilities found</h3>
+                <p>Run a scan from the Scanner page to populate this dashboard.</p>
+            </div>
+            """, unsafe_allow_html=True)
             
     elif selection == "Scanner":
-        st.header("Vulnerability Scanner")
+        st.markdown('<div class="pg-title"><span class="pg-icon">🔍</span> Scanner</div>', unsafe_allow_html=True)
         
         # Select sources to scan
-        st.subheader("Select Sources to Scan")
+        st.markdown("**Sources**")
         # Updated to include Google Cloud Security Bulletins as a source option
         selected_sources = st.multiselect(
             "Sources",
-            ["NVD", "CISA", "Cisco", "Google"],  # Added Google Cloud as a supported source
+            ["NVD", "CISA", "Cisco", "Google", "Microsoft", "Fortinet", "Palo Alto", "Adobe"],
             default=["NVD", "CISA"]
         )
         
@@ -920,8 +1535,11 @@ def main():
             elif not st.session_state.scan_results:
                 st.warning("No vulnerabilities to send. Please scan first.")
         
-        # Show existing vulnerabilities
-        st.subheader("Current Critical & High Vulnerabilities")
+        st.divider()
+        render_openvas_section()
+
+        st.markdown("---")
+        st.markdown("**Current Critical & High Vulnerabilities**")
         critical_high_vulns = get_vulnerabilities(severity_filter=["Critical", "High"])
         
         if critical_high_vulns:
@@ -942,7 +1560,7 @@ def main():
             st.info("No critical or high vulnerabilities in the database")
     
     elif selection == "Email Notifications":
-        st.header("Email Notification Settings")
+        st.markdown('<div class="pg-title"><span class="pg-icon">📧</span> Notifications</div>', unsafe_allow_html=True)
         
         # Show current recipients
         st.subheader("Current Recipients")
@@ -1001,7 +1619,7 @@ def main():
                 st.warning("No recipients configured. Please add at least one recipient.")
     
     elif selection == "Settings":
-        st.header("Settings")
+        st.markdown('<div class="pg-title"><span class="pg-icon">⚙️</span> Settings</div>', unsafe_allow_html=True)
         
         # Email Configuration
         st.subheader("Email Configuration")
@@ -1012,14 +1630,17 @@ def main():
             smtp_server = st.text_input("SMTP Server", value=EMAIL_CONFIG["smtp_server"])
             smtp_port = st.number_input("SMTP Port", value=EMAIL_CONFIG["smtp_port"])
             username = st.text_input("SMTP Username", value=EMAIL_CONFIG["username"])
-            password = st.text_input("SMTP Password", value=EMAIL_CONFIG["password"], type="password")
+            password = st.text_input("SMTP Password", value="", type="password",
+                                     placeholder="••••••••  (leave blank to keep current)",
+                                     help="Stored securely. Leave blank to keep the existing password.")
             
             if st.form_submit_button("Save Email Settings"):
                 EMAIL_CONFIG["sender_email"] = sender_email
                 EMAIL_CONFIG["smtp_server"] = smtp_server
                 EMAIL_CONFIG["smtp_port"] = int(smtp_port)
                 EMAIL_CONFIG["username"] = username
-                EMAIL_CONFIG["password"] = password
+                if password:  # only overwrite if user typed a new password
+                    EMAIL_CONFIG["password"] = password
                 
                 st.success("Email settings saved")
         
@@ -1027,14 +1648,9 @@ def main():
         if st.button("Test SMTP Connection"):
             try:
                 with st.spinner("Testing SMTP connection..."):
-                    st.info(f"Connecting to {EMAIL_CONFIG['smtp_server']}:{EMAIL_CONFIG['smtp_port']}...")
                     server = smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"])
-                    server.set_debuglevel(1)
-                    
-                    st.info("Starting TLS...")
+                    server.set_debuglevel(0)
                     server.starttls()
-                    
-                    st.info(f"Logging in with username: {EMAIL_CONFIG['username']}...")
                     server.login(EMAIL_CONFIG["username"], EMAIL_CONFIG["password"])
                     
                     st.success("SMTP connection successful! Your email settings are working.")
@@ -1058,13 +1674,19 @@ def main():
 
 def render_ai_analysis_page():
     """Render the AI Analysis page content"""
-    st.header("AI-Powered Vulnerability Analysis")
+    st.markdown('<div class="pg-title"><span class="pg-icon">🤖</span> AI Analysis</div>', unsafe_allow_html=True)
     
     # Get vulnerabilities from database
     vulnerabilities = get_vulnerabilities()
 
     if not vulnerabilities:
-        st.info("No vulnerabilities found in the database. Please use the Scanner to find vulnerabilities first.")
+        st.markdown("""
+        <div class="empty-state">
+            <div class="empty-icon">🤖</div>
+            <h3>No data available</h3>
+            <p>Scan for vulnerabilities first to unlock AI analysis.</p>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
     # Create tabs for different AI features
